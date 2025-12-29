@@ -11,6 +11,7 @@ from .config import (
     EMAILNATOR_GENERATE_ENDPOINT,
     EMAILNATOR_HEADERS,
     EMAILNATOR_MESSAGE_LIST_ENDPOINT,
+    SOCKS_PROXY,
 )
 
 
@@ -35,8 +36,15 @@ class Emailnator:
             headers = EMAILNATOR_HEADERS.copy()
             headers["x-xsrf-token"] = unquote(cookies["XSRF-TOKEN"])
 
+        # Build proxy configuration from SOCKS_PROXY env var
+        # Format: socks5://[user[:pass]@]host[:port][#remark]
+        proxy_url = None
+        if SOCKS_PROXY:
+            # Remove the remark part (after #) if present
+            proxy_url = SOCKS_PROXY.split("#")[0] if "#" in SOCKS_PROXY else SOCKS_PROXY
+
         # Initialize HTTP session
-        self.s = requests.Session(headers=headers, cookies=cookies)
+        self.s = requests.Session(headers=headers, cookies=cookies, proxy=proxy_url)
 
         # Prepare email generation options
         data = {"email": []}

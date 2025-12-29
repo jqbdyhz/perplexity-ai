@@ -14,6 +14,10 @@ services:
       # Perplexity 账户凭证 (可选，用于高级功能)
       - PPLX_NEXT_AUTH_CSRF_TOKEN=${PPLX_NEXT_AUTH_CSRF_TOKEN:-}
       - PPLX_SESSION_TOKEN=${PPLX_SESSION_TOKEN:-}
+      # SOCKS 代理配置 (可选)
+      # 格式: socks5://[user[:pass]@]host[:port][#remark]
+      # 示例: socks5://127.0.0.1:1080 或 socks5://user:pass@proxy.example.com:1080
+      - SOCKS_PROXY=${SOCKS_PROXY:-}
     restart: unless-stopped
     # 资源限制 (可选)
     deploy:

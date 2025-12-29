@@ -5,7 +5,16 @@ This module contains all configurable constants used throughout the library.
 Modify these values to customize behavior without changing core code.
 """
 
-from typing import Dict
+import os
+from typing import Dict, Optional
+
+# SOCKS Proxy Configuration
+# Format: socks5://[user[:pass]@]host[:port][#remark]
+# Examples:
+#   socks5://127.0.0.1:1080
+#   socks5://user:pass@127.0.0.1:1080
+#   socks5://user:pass@127.0.0.1:1080#my-proxy
+SOCKS_PROXY: Optional[str] = os.getenv("SOCKS_PROXY", None)
 
 # API Configuration
 API_BASE_URL = "https://www.perplexity.ai"

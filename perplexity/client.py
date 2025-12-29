@@ -20,6 +20,7 @@ from .config import (
     ENDPOINT_AUTH_SIGNIN,
     ENDPOINT_SSE_ASK,
     ENDPOINT_UPLOAD_URL,
+    SOCKS_PROXY,
 )
 from .emailnator import Emailnator
 
@@ -30,11 +31,19 @@ class Client:
     """
 
     def __init__(self, cookies={}):
+        # Build proxy configuration from SOCKS_PROXY env var
+        # Format: socks5://[user[:pass]@]host[:port][#remark]
+        proxy_url = None
+        if SOCKS_PROXY:
+            # Remove the remark part (after #) if present
+            proxy_url = SOCKS_PROXY.split("#")[0] if "#" in SOCKS_PROXY else SOCKS_PROXY
+
         # Initialize an HTTP session with default headers and optional cookies
         self.session = requests.Session(
             headers=DEFAULT_HEADERS.copy(),
             cookies=cookies,
             impersonate="chrome",
+            proxy=proxy_url,
         )
 
         # Flags and counters for account and query management
