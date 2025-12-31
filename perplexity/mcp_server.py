@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_http_headers
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .client import Client
 from .config import LABS_MODELS, MODEL_MAPPINGS, SEARCH_LANGUAGES, SEARCH_MODES, SEARCH_SOURCES
@@ -40,6 +42,15 @@ mcp = FastMCP("perplexity-mcp")
 
 # 添加认证中间件
 mcp.add_middleware(AuthMiddleware(MCP_TOKEN))
+
+
+# 健康检查端点 (不需要认证)
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """健康检查接口，用于监控服务状态"""
+    return JSONResponse({"status": "healthy", "service": "perplexity-mcp"})
+
+
 _client: Optional[Client] = None
 
 
