@@ -28,6 +28,7 @@ dependencies = [
     "curl_cffi>=0.5.7",
     "websocket-client>=1.9.0",
     "fastmcp>=0.1.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,9 @@ dev = [
 all = [
     "perplexity-api[driver,dev]",
 ]
+
+[project.scripts]
+perplexity = "perplexity.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/ESousa97/perplexity-ai"

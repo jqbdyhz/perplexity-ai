@@ -1,11 +1,13 @@
 """
 fastmcp-based MCP server exposing Perplexity search and model listing tools.
 Provides both stdio (console) and HTTP transports.
+Supports multi-token pool with load balancing and dynamic management.
 """
 
 import argparse
+import asyncio
 import os
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -13,10 +15,16 @@ from fastmcp.server.dependencies import get_http_headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .client import Client
-from .config import LABS_MODELS, MODEL_MAPPINGS, SEARCH_LANGUAGES, SEARCH_MODES, SEARCH_SOURCES
-from .exceptions import ValidationError
-from .utils import sanitize_query, validate_file_data, validate_query_limits, validate_search_params
+try:
+    from .client_pool import ClientPool
+    from .config import LABS_MODELS, MODEL_MAPPINGS, SEARCH_LANGUAGES, SEARCH_MODES, SEARCH_SOURCES
+    from .exceptions import ValidationError
+    from .utils import sanitize_query, validate_file_data, validate_query_limits, validate_search_params
+except ImportError:
+    from client_pool import ClientPool
+    from config import LABS_MODELS, MODEL_MAPPINGS, SEARCH_LANGUAGES, SEARCH_MODES, SEARCH_SOURCES
+    from exceptions import ValidationError
+    from utils import sanitize_query, validate_file_data, validate_query_limits, validate_search_params
 
 # API 密钥配置（从环境变量读取，默认为 sk-123456）
 MCP_TOKEN = os.getenv("MCP_TOKEN", "sk-123456")
@@ -24,10 +32,10 @@ MCP_TOKEN = os.getenv("MCP_TOKEN", "sk-123456")
 
 class AuthMiddleware(Middleware):
     """Bearer Token 认证中间件"""
-    
+
     def __init__(self, token: str):
         self.token = token
-    
+
     async def on_request(self, context: MiddlewareContext, call_next):
         """验证请求的 Authorization header"""
         headers = get_http_headers()
@@ -43,33 +51,120 @@ mcp = FastMCP("perplexity-mcp")
 # 添加认证中间件
 mcp.add_middleware(AuthMiddleware(MCP_TOKEN))
 
+# 全局 ClientPool 实例
+_pool: Optional[ClientPool] = None
+
+
+def _get_pool() -> ClientPool:
+    """Get or create the singleton ClientPool instance."""
+    global _pool
+    if _pool is None:
+        _pool = ClientPool()
+    return _pool
+
 
 # 健康检查端点 (不需要认证)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
-    """健康检查接口，用于监控服务状态"""
-    return JSONResponse({"status": "healthy", "service": "perplexity-mcp"})
+    """健康检查接口，用于监控服务状态，包含号池摘要"""
+    pool = _get_pool()
+    status = pool.get_status()
+    return JSONResponse({
+        "status": "healthy",
+        "service": "perplexity-mcp",
+        "pool": {
+            "total": status["total"],
+            "available": status["available"],
+        }
+    })
 
 
-_client: Optional[Client] = None
+# 号池状态查询端点 (不需要认证)
+@mcp.custom_route("/pool/status", methods=["GET"])
+async def pool_status(request: Request) -> JSONResponse:
+    """号池状态查询接口，返回详细的token池运行时状态"""
+    pool = _get_pool()
+    return JSONResponse(pool.get_status())
 
 
-def _get_client() -> Client:
-    """Create a singleton Client instance."""
-    global _client
-    if _client is None:
-        csrf_token = os.getenv("PPLX_NEXT_AUTH_CSRF_TOKEN")
-        session_token = os.getenv("PPLX_SESSION_TOKEN")
-        cookies = (
-            {
-                "next-auth.csrf-token": csrf_token,
-                "__Secure-next-auth.session-token": session_token,
-            }
-            if csrf_token and session_token
-            else {}
-        )
-        _client = Client(cookies)
-    return _client
+# 号池管理 API 端点 (用于前端管理页面)
+@mcp.custom_route("/pool/{action}", methods=["POST"])
+async def pool_api(request: Request) -> JSONResponse:
+    """号池管理 API 接口，供前端管理页面调用"""
+    from perplexity.config import ADMIN_TOKEN
+
+    action = request.path_params.get("action")
+    pool = _get_pool()
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # 需要认证的操作列表
+    protected_actions = {"add", "remove", "enable", "disable", "reset"}
+
+    # 验证 admin token
+    if action in protected_actions:
+        if not ADMIN_TOKEN:
+            return JSONResponse({
+                "status": "error",
+                "message": "Admin token not configured. Set PPLX_ADMIN_TOKEN environment variable."
+            }, status_code=403)
+
+        # 从 header 或 body 中获取 token
+        provided_token = request.headers.get("X-Admin-Token") or body.get("admin_token")
+
+        if not provided_token:
+            return JSONResponse({
+                "status": "error",
+                "message": "Authentication required. Provide admin token."
+            }, status_code=401)
+
+        if provided_token != ADMIN_TOKEN:
+            return JSONResponse({
+                "status": "error",
+                "message": "Invalid admin token."
+            }, status_code=401)
+
+    client_id = body.get("id")
+    csrf_token = body.get("csrf_token")
+    session_token = body.get("session_token")
+
+    if action == "list":
+        return JSONResponse(pool.list_clients())
+    elif action == "add":
+        if not all([client_id, csrf_token, session_token]):
+            return JSONResponse({"status": "error", "message": "Missing required parameters"})
+        return JSONResponse(pool.add_client(client_id, csrf_token, session_token))
+    elif action == "remove":
+        if not client_id:
+            return JSONResponse({"status": "error", "message": "Missing required parameter: id"})
+        return JSONResponse(pool.remove_client(client_id))
+    elif action == "enable":
+        if not client_id:
+            return JSONResponse({"status": "error", "message": "Missing required parameter: id"})
+        return JSONResponse(pool.enable_client(client_id))
+    elif action == "disable":
+        if not client_id:
+            return JSONResponse({"status": "error", "message": "Missing required parameter: id"})
+        return JSONResponse(pool.disable_client(client_id))
+    elif action == "reset":
+        if not client_id:
+            return JSONResponse({"status": "error", "message": "Missing required parameter: id"})
+        return JSONResponse(pool.reset_client(client_id))
+    else:
+        return JSONResponse({"status": "error", "message": f"Unknown action: {action}"})
+
+
+# 管理页面路由
+@mcp.custom_route("/admin", methods=["GET"])
+async def admin_page(request: Request):
+    """管理页面"""
+    from starlette.responses import FileResponse
+    import pathlib
+    static_path = pathlib.Path(__file__).parent / "static" / "admin.html"
+    return FileResponse(static_path, media_type="text/html")
 
 
 def _normalize_files(files: Optional[Union[Dict[str, Any], Iterable[str]]]) -> Dict[str, Any]:
@@ -155,7 +250,18 @@ def _run_query(
     files: Optional[Union[Dict[str, Any], Iterable[str]]] = None,
 ) -> Dict[str, Any]:
     """Execute a Perplexity query (non-streaming) and return the final response."""
-    client = _get_client()
+    pool = _get_pool()
+    client_id, client = pool.get_client()
+
+    if client is None:
+        # All clients are in backoff
+        earliest = pool.get_earliest_available_time()
+        return {
+            "status": "error",
+            "error_type": "NoAvailableClients",
+            "message": f"All clients are currently unavailable. Earliest available at: {earliest}",
+        }
+
     try:
         clean_query = sanitize_query(query)
         chosen_sources = sources or ["web"]
@@ -179,11 +285,32 @@ def _run_query(
             language=language,
             incognito=incognito,
         )
-        
+
+        # Mark success
+        pool.mark_client_success(client_id)
+
         # 只返回精简的最终结果
         clean_result = _extract_clean_result(response)
         return {"status": "ok", "data": clean_result}
-    except Exception as exc:  # fastmcp will surface this to the client
+    except ValidationError as exc:
+        # Pro mode specific failures (like quota exhausted) - reduce weight
+        if mode == "pro" and "pro" in str(exc).lower():
+            pool.mark_client_pro_failure(client_id)
+        else:
+            pool.mark_client_failure(client_id)
+        return {
+            "status": "error",
+            "error_type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+    except Exception as exc:
+        # Check if it's a pro-related failure
+        error_msg = str(exc).lower()
+        if mode == "pro" and any(kw in error_msg for kw in ["pro", "quota", "limit", "remaining"]):
+            pool.mark_client_pro_failure(client_id)
+        else:
+            # Mark general failure for exponential backoff
+            pool.mark_client_failure(client_id)
         return {
             "status": "error",
             "error_type": exc.__class__.__name__,
@@ -195,9 +322,9 @@ def _run_query(
 def list_models() -> Dict[str, Any]:
     """
     获取 Perplexity 支持的所有搜索模式和模型列表
-    
+
     当你需要了解可用的模型选项时调用此工具。
-    
+
     Returns:
         包含 modes (搜索模式)、model_mappings (模型映射) 和 labs_models (实验模型) 的字典
     """
@@ -205,7 +332,7 @@ def list_models() -> Dict[str, Any]:
 
 
 @mcp.tool
-def search(
+async def search(
     query: str,
     mode: str = "pro",
     model: Optional[str] = None,
@@ -245,11 +372,12 @@ def search(
     # 限制 search 只能使用 auto 或 pro 模式
     if mode not in ["auto", "pro"]:
         mode = "pro"
-    return _run_query(query, mode, model, sources, language, incognito, files)
+    # 使用 asyncio.to_thread 避免阻塞事件循环
+    return await asyncio.to_thread(_run_query, query, mode, model, sources, language, incognito, files)
 
 
 @mcp.tool
-def research(
+async def research(
     query: str,
     mode: str = "reasoning",
     model: Optional[str] = "gemini-3.0-pro",
@@ -289,7 +417,93 @@ def research(
     # 限制 research 只能使用 reasoning 或 deep research 模式
     if mode not in ["reasoning", "deep research"]:
         mode = "reasoning"
-    return _run_query(query, mode, model, sources, language, incognito, files)
+    # 使用 asyncio.to_thread 避免阻塞事件循环
+    return await asyncio.to_thread(_run_query, query, mode, model, sources, language, incognito, files)
+
+
+@mcp.tool
+async def pool_manage(
+    action: Literal["list", "add", "remove", "info", "enable", "disable", "reset", "status"],
+    id: Optional[str] = None,
+    csrf_token: Optional[str] = None,
+    session_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    号池管理工具 - 用于动态管理 token 池
+
+    Args:
+        action: 操作类型
+            - 'list': 列举所有 token（返回 id、可用状态和权重）
+            - 'add': 新增 token 到池中
+            - 'remove': 从池中删除指定 token
+            - 'info': 获取用户会话信息（如指定 id 则获取单个，否则获取全部）
+            - 'enable': 启用指定 token
+            - 'disable': 禁用指定 token
+            - 'reset': 重置指定 token 的失败状态和权重
+            - 'status': 获取号池详细状态
+        id: token 标识（add/remove/enable/disable/reset 操作必需，info 操作可选）
+        csrf_token: CSRF token（add 操作必需）
+        session_token: Session token（add 操作必需）
+
+    Returns:
+        list 操作: {"status": "ok", "data": {"clients": [{"id": "...", "available": true, "weight": 100}, ...]}}
+        add 操作: {"status": "ok", "message": "Client 'xxx' added successfully"}
+        remove 操作: {"status": "ok", "message": "Client 'xxx' removed successfully"}
+        info 操作: {"status": "ok", "data": {...用户会话信息...}}
+        enable/disable/reset 操作: {"status": "ok", "message": "..."}
+        status 操作: {"status": "ok", "data": {...详细状态...}}
+        错误: {"status": "error", "message": "..."}
+    """
+    pool = _get_pool()
+
+    if action == "list":
+        return pool.list_clients()
+
+    elif action == "add":
+        if not all([id, csrf_token, session_token]):
+            return {
+                "status": "error",
+                "message": "Missing required parameters: id, csrf_token, session_token",
+            }
+        return pool.add_client(id, csrf_token, session_token)
+
+    elif action == "remove":
+        if not id:
+            return {
+                "status": "error",
+                "message": "Missing required parameter: id",
+            }
+        return pool.remove_client(id)
+
+    elif action == "info":
+        # info 操作会发起网络请求获取用户信息，使用 to_thread 避免阻塞
+        if id:
+            return await asyncio.to_thread(pool.get_client_user_info, id)
+        return await asyncio.to_thread(pool.get_all_clients_user_info)
+
+    elif action == "enable":
+        if not id:
+            return {"status": "error", "message": "Missing required parameter: id"}
+        return pool.enable_client(id)
+
+    elif action == "disable":
+        if not id:
+            return {"status": "error", "message": "Missing required parameter: id"}
+        return pool.disable_client(id)
+
+    elif action == "reset":
+        if not id:
+            return {"status": "error", "message": "Missing required parameter: id"}
+        return pool.reset_client(id)
+
+    elif action == "status":
+        return {"status": "ok", "data": pool.get_status()}
+
+    else:
+        return {
+            "status": "error",
+            "message": f"Invalid action: {action}. Valid actions are: list, add, remove, info, enable, disable, reset, status",
+        }
 
 
 def run_server(
@@ -298,6 +512,9 @@ def run_server(
     port: int = 8000,
 ) -> None:
     """Start the MCP server with the requested transport."""
+    # Initialize the pool on startup
+    _get_pool()
+
     if transport == "http":
         mcp.run(transport="http", host=host, port=port)
     else:
@@ -320,4 +537,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

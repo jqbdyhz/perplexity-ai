@@ -1,7 +1,6 @@
 __pycache__
 *.pyc
 *.egg-info
-.claude
 .cursor
 logs
 openspec
@@ -9,3 +8,4 @@ openspec
 mcp_test_results.txt
 .env
 *.log
+token_pool_config.json

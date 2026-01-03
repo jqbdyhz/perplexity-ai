@@ -6,7 +6,26 @@ Modify these values to customize behavior without changing core code.
 """
 
 import os
+from pathlib import Path
 from typing import Dict, Optional
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+
+# Try to load .env from multiple locations
+_env_locations = [
+    Path.cwd() / ".env",  # Current working directory
+    Path(__file__).parent.parent / ".env",  # Project root
+    Path.home() / ".perplexity" / ".env",  # User home directory
+]
+
+for _env_path in _env_locations:
+    if _env_path.exists():
+        load_dotenv(_env_path)
+        break
+else:
+    # Load from default location if no .env found
+    load_dotenv()
 
 # SOCKS Proxy Configuration
 # Format: socks5://[user[:pass]@]host[:port][#remark]
@@ -15,6 +34,11 @@ from typing import Dict, Optional
 #   socks5://user:pass@127.0.0.1:1080
 #   socks5://user:pass@127.0.0.1:1080#my-proxy
 SOCKS_PROXY: Optional[str] = os.getenv("SOCKS_PROXY", None)
+
+# Token Pool Configuration
+# Path to JSON config file containing multiple tokens for load balancing
+# Format: {"tokens": [{"id": "user1", "csrf_token": "xxx", "session_token": "yyy"}, ...]}
+PPLX_TOKEN_POOL_CONFIG: Optional[str] = os.getenv("PPLX_TOKEN_POOL_CONFIG", None)
 
 # API Configuration
 API_BASE_URL = "https://www.perplexity.ai"
@@ -136,6 +160,11 @@ LOG_FILE = "perplexity.log"
 RATE_LIMIT_MIN_DELAY = 1.0  # seconds
 RATE_LIMIT_MAX_DELAY = 3.0  # seconds
 RATE_LIMIT_ENABLED = True
+
+# Admin Authentication
+# Set this environment variable to enable admin authentication for pool management
+# If not set, admin operations will be disabled for security
+ADMIN_TOKEN: Optional[str] = os.getenv("PPLX_ADMIN_TOKEN", None)
 
 # Validation Patterns
 EMAIL_SUBJECT_PATTERN = "Sign in to Perplexity"

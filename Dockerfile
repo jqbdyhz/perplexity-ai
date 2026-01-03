@@ -36,6 +36,12 @@ COPY --from=builder /install/lib/python3.12/site-packages /usr/local/lib/python3
 # 复制应用代码
 COPY perplexity/ ./perplexity/
 
+# 复制 token pool 配置文件
+COPY token_pool_config.json ./token_pool_config.json
+
+# 设置环境变量，默认加载 token pool 配置
+ENV PPLX_TOKEN_POOL_CONFIG=/app/token_pool_config.json
+
 # 暴露端口
 EXPOSE 8000
 

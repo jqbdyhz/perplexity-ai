@@ -62,6 +62,22 @@ class Client:
         # Initialize session by making a GET request
         self.session.get(ENDPOINT_AUTH_SESSION)
 
+    def get_user_info(self) -> dict:
+        """
+        Get user session information from the auth session endpoint.
+
+        Returns:
+            dict: User session info including user details if logged in,
+                  or empty dict if anonymous/not logged in.
+        """
+        try:
+            resp = self.session.get(ENDPOINT_AUTH_SESSION)
+            if resp.ok:
+                return resp.json()
+            return {}
+        except Exception:
+            return {}
+
     def create_account(self, cookies):
         """
         Creates a new account using Emailnator cookies.
