@@ -167,6 +167,146 @@ async def admin_page(request: Request):
     return FileResponse(static_path, media_type="text/html")
 
 
+# ==================== Heartbeat API 端点 ====================
+
+@mcp.custom_route("/heartbeat/config", methods=["GET"])
+async def heartbeat_config(request: Request) -> JSONResponse:
+    """获取心跳配置"""
+    pool = _get_pool()
+    return JSONResponse({
+        "status": "ok",
+        "config": pool.get_heartbeat_config()
+    })
+
+
+@mcp.custom_route("/heartbeat/config", methods=["POST"])
+async def heartbeat_config_update(request: Request) -> JSONResponse:
+    """更新心跳配置"""
+    from perplexity.config import ADMIN_TOKEN
+
+    if not ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Admin token not configured. Set PPLX_ADMIN_TOKEN environment variable."
+        }, status_code=403)
+
+    provided_token = request.headers.get("X-Admin-Token")
+    if not provided_token or provided_token != ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Invalid or missing admin token."
+        }, status_code=401)
+
+    pool = _get_pool()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({
+            "status": "error",
+            "message": "Invalid JSON body"
+        }, status_code=400)
+
+    result = pool.update_heartbeat_config(body)
+
+    # Send Telegram notification if configured
+    if result.get("status") == "ok":
+        config = result.get("config", {})
+        if config.get("tg_bot_token") and config.get("tg_chat_id"):
+            await pool._send_telegram_notification("Perplexity config updated")
+
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/heartbeat/start", methods=["POST"])
+async def heartbeat_start(request: Request) -> JSONResponse:
+    """启动心跳后台任务"""
+    from perplexity.config import ADMIN_TOKEN
+
+    if not ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Admin token not configured. Set PPLX_ADMIN_TOKEN environment variable."
+        }, status_code=403)
+
+    provided_token = request.headers.get("X-Admin-Token")
+    if not provided_token or provided_token != ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Invalid or missing admin token."
+        }, status_code=401)
+
+    pool = _get_pool()
+    started = pool.start_heartbeat()
+    if started:
+        return JSONResponse({"status": "ok", "message": "Heartbeat started"})
+    elif not pool.is_heartbeat_enabled():
+        return JSONResponse({"status": "error", "message": "Heartbeat is disabled in config"})
+    else:
+        return JSONResponse({"status": "ok", "message": "Heartbeat already running"})
+
+
+@mcp.custom_route("/heartbeat/stop", methods=["POST"])
+async def heartbeat_stop(request: Request) -> JSONResponse:
+    """停止心跳后台任务"""
+    from perplexity.config import ADMIN_TOKEN
+
+    if not ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Admin token not configured. Set PPLX_ADMIN_TOKEN environment variable."
+        }, status_code=403)
+
+    provided_token = request.headers.get("X-Admin-Token")
+    if not provided_token or provided_token != ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Invalid or missing admin token."
+        }, status_code=401)
+
+    pool = _get_pool()
+    stopped = pool.stop_heartbeat()
+    if stopped:
+        return JSONResponse({"status": "ok", "message": "Heartbeat stopped"})
+    else:
+        return JSONResponse({"status": "ok", "message": "Heartbeat not running"})
+
+
+@mcp.custom_route("/heartbeat/test", methods=["POST"])
+async def heartbeat_test(request: Request) -> JSONResponse:
+    """手动触发心跳测试"""
+    from perplexity.config import ADMIN_TOKEN
+
+    if not ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Admin token not configured. Set PPLX_ADMIN_TOKEN environment variable."
+        }, status_code=403)
+
+    provided_token = request.headers.get("X-Admin-Token")
+    if not provided_token or provided_token != ADMIN_TOKEN:
+        return JSONResponse({
+            "status": "error",
+            "message": "Invalid or missing admin token."
+        }, status_code=401)
+
+    pool = _get_pool()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    client_id = body.get("id")
+
+    if client_id:
+        # Test specific client
+        result = await pool.test_client(client_id)
+        return JSONResponse(result)
+    else:
+        # Test all clients
+        result = await pool.test_all_clients()
+        return JSONResponse(result)
+
+
 def _normalize_files(files: Optional[Union[Dict[str, Any], Iterable[str]]]) -> Dict[str, Any]:
     """
     Accept either a dict of filename->data or an iterable of file paths,
@@ -428,7 +568,7 @@ def run_server(
 ) -> None:
     """Start the MCP server with the requested transport."""
     # Initialize the pool on startup
-    _get_pool()
+    pool = _get_pool()
 
     if transport == "http":
         mcp.run(transport="http", host=host, port=port)

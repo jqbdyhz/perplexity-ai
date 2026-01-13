@@ -216,6 +216,19 @@
             // Form state
             const [addForm, setAddForm] = useState({ id: '', csrf: '', session: '' });
 
+            // Heartbeat state
+            const [hbConfig, setHbConfig] = useState(null);
+            const [isGlobalTesting, setIsGlobalTesting] = useState(false);
+            const [testingIds, setTestingIds] = useState(new Set());
+            const [isHbConfigOpen, setIsHbConfigOpen] = useState(false);
+            const [hbConfigForm, setHbConfigForm] = useState({
+                enable: false,
+                question: '',
+                interval: 6,
+                tg_bot_token: null,
+                tg_chat_id: null
+            });
+
             const addToast = useCallback((msg, type = 'success') => {
                 const id = Date.now();
                 setToasts(prev => [...prev, { id, msg, type }]);
@@ -232,6 +245,13 @@
                     const jsonData = await resp.json();
                     setData(jsonData);
                     setLastSync(new Date().toLocaleTimeString('en-US', { hour12: false }));
+
+                    // Also fetch heartbeat config
+                    const hbResp = await fetch(`${API_BASE}/heartbeat/config`);
+                    const hbJson = await hbResp.json();
+                    if (hbJson.status === 'ok') {
+                        setHbConfig(hbJson.config);
+                    }
                 } catch (e) {
                     addToast("CONNECTION_LOST", "error");
                 } finally {
@@ -255,6 +275,19 @@
                 }
             }, [adminToken]);
 
+            // Sync hbConfigForm when hbConfig changes
+            useEffect(() => {
+                if (hbConfig) {
+                    setHbConfigForm({
+                        enable: hbConfig.enable || false,
+                        question: hbConfig.question || '',
+                        interval: hbConfig.interval || 6,
+                        tg_bot_token: hbConfig.tg_bot_token || null,
+                        tg_chat_id: hbConfig.tg_chat_id || null
+                    });
+                }
+            }, [hbConfig]);
+
             const apiCall = useCallback(async (action, params = {}) => {
                 try {
                     const headers = { 'Content-Type': 'application/json' };
@@ -262,7 +295,9 @@
                         headers['X-Admin-Token'] = adminToken;
                     }
 
-                    const resp = await fetch(`${API_BASE}/pool/${action}`, {
+                    const url = action.startsWith('heartbeat') ? `${API_BASE}/${action}` : `${API_BASE}/pool/${action}`;
+
+                    const resp = await fetch(url, {
                         method: 'POST',
                         headers,
                         body: JSON.stringify(params)
@@ -282,6 +317,80 @@
                     return { status: 'error', message: e.message };
                 }
             }, [adminToken]);
+
+            const handleHeartbeatAction = async (action, params = {}) => {
+                 if (!isAuthenticated) {
+                    addToast('AUTH_REQUIRED', 'error');
+                    return;
+                }
+
+                // Set testing state
+                if (action === 'test') {
+                    if (params.id) {
+                        setTestingIds(prev => {
+                            const next = new Set(prev);
+                            next.add(params.id);
+                            return next;
+                        });
+                    } else {
+                        setIsGlobalTesting(true);
+                    }
+                }
+
+                try {
+                    const resp = await apiCall(`heartbeat/${action}`, params);
+                    if (resp.status === 'ok') {
+                        addToast(`HEARTBEAT_${action.toUpperCase()}_OK`);
+                        refreshData();
+                    } else {
+                        addToast(resp.message, 'error');
+                    }
+                } finally {
+                    // Clear testing state
+                    if (action === 'test') {
+                        if (params.id) {
+                            setTestingIds(prev => {
+                                const next = new Set(prev);
+                                next.delete(params.id);
+                                return next;
+                            });
+                        } else {
+                            setIsGlobalTesting(false);
+                        }
+                    }
+                }
+            };
+
+            const handleSaveHbConfig = async () => {
+                if (!isAuthenticated) {
+                    addToast('AUTH_REQUIRED', 'error');
+                    return;
+                }
+
+                try {
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (adminToken) {
+                        headers['X-Admin-Token'] = adminToken;
+                    }
+
+                    const resp = await fetch(`${API_BASE}/heartbeat/config`, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(hbConfigForm)
+                    });
+                    const result = await resp.json();
+
+                    if (result.status === 'ok') {
+                        addToast('CONFIG_SAVED');
+                        setHbConfig(result.config);
+                        setIsHbConfigOpen(false);
+                    } else {
+                        addToast(result.message || 'SAVE_FAILED', 'error');
+                    }
+                } catch (e) {
+                    addToast('SAVE_FAILED', 'error');
+                }
+            };
 
             const handleAddToken = async () => {
                 if (!isAuthenticated) {
@@ -351,11 +460,25 @@
                 return 'bg-danger';
             };
 
+            const maskIdentifier = (id) => {
+                if (!id || id.length <= 6) return id;
+                const start = id.substring(0, 3);
+                const end = id.substring(id.length - 3);
+                return `${start}***${end}`;
+            };
+
             const handleLogout = () => {
                 addToast('LOGGED_OUT');
             };
 
             const enabledCount = useMemo(() => (data.clients || []).filter(c => c.enabled).length, [data.clients]);
+
+            const getHeartbeatStatus = () => {
+                if (!hbConfig) return { label: 'UNKNOWN', color: 'text-gray-500' };
+                if (!hbConfig.enable) return { label: 'DISABLED', color: 'text-gray-500' };
+                return { label: 'ACTIVE', color: 'text-green-500' };
+            };
+            const hbStatus = getHeartbeatStatus();
 
             return (
                 <div className="max-w-7xl mx-auto">
@@ -367,7 +490,7 @@
                                     Perplexity<br/>
                                     <span className="text-transparent bg-clip-text bg-gradient-to-r from-acid via-neon-pink to-neon-blue">Token Pool</span>
                                 </h1>
-                                <p className="font-mono text-gray-400 mt-2 bg-gray-900 inline-block px-2">/// MANAGER_V1.0_REACT</p>
+                                <p className="font-mono text-gray-400 mt-2 bg-gray-900 inline-block px-2">/// MANAGER_V1.1_REACT</p>
                             </div>
                             <div className="font-mono text-xs md:text-sm text-right">
                                 <div className="text-acid">{lastSync ? `LAST_SYNC: ${lastSync}` : 'SYNCING...'}</div>
@@ -389,8 +512,110 @@
                         <BrutalistCard number="01" label="Total Clients" value={data.total || 0} colorClass="text-acid" />
                         <BrutalistCard number="02" label="Available" value={data.available || 0} colorClass="text-neon-blue" />
                         <BrutalistCard number="03" label="Enabled" value={enabledCount} colorClass="text-neon-pink" />
-                        <BrutalistCard number="04" label="Mode" value={(data.mode || '-').toUpperCase()} colorClass="text-white" />
+                        <BrutalistCard number="04" label="Heartbeat" value={hbStatus.label} colorClass={hbStatus.color} />
                     </div>
+
+                    {/* Heartbeat Controls (Only if Auth) */}
+                    {isAuthenticated && hbConfig && (
+                        <div className="mb-8 p-4 border border-gray-700 bg-gray-900/30">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-4">
+                                    <h3 className="font-bold text-white uppercase tracking-wider">♥ Heartbeat Control</h3>
+                                    <div className="text-xs font-mono text-gray-500">INTERVAL: {hbConfig.interval}H</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        onClick={() => setIsHbConfigOpen(!isHbConfigOpen)}
+                                        className="px-3 py-1 bg-gray-800 border border-gray-600 hover:bg-white hover:text-black font-mono text-xs uppercase transition-colors"
+                                    >
+                                        {isHbConfigOpen ? 'Hide Config' : 'Config'}
+                                    </button>
+                                    {hbConfig.enable ? (
+                                        <button
+                                            onClick={() => handleHeartbeatAction('stop')}
+                                            className="px-3 py-1 border border-red-500 text-red-500 hover:bg-red-500 hover:text-white font-mono text-xs uppercase transition-colors"
+                                        >
+                                            Stop Task
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={() => handleHeartbeatAction('start')}
+                                            className="px-3 py-1 border border-green-500 text-green-500 hover:bg-green-500 hover:text-white font-mono text-xs uppercase transition-colors"
+                                        >
+                                            Start Task
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Config Panel */}
+                            {isHbConfigOpen && (
+                                <div className="border-t border-gray-700 pt-4 mt-4">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        <div>
+                                            <label className="block font-mono text-xs text-gray-500 mb-1 uppercase">Enable</label>
+                                            <select
+                                                value={hbConfigForm.enable ? 'true' : 'false'}
+                                                onChange={e => setHbConfigForm({...hbConfigForm, enable: e.target.value === 'true'})}
+                                                className="w-full bg-gray-800 border border-gray-700 px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-acid"
+                                            >
+                                                <option value="true">Enabled</option>
+                                                <option value="false">Disabled</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block font-mono text-xs text-gray-500 mb-1 uppercase">Interval (Hours)</label>
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                max="24"
+                                                value={hbConfigForm.interval}
+                                                onChange={e => setHbConfigForm({...hbConfigForm, interval: parseInt(e.target.value) || 6})}
+                                                className="w-full bg-gray-800 border border-gray-700 px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-acid"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block font-mono text-xs text-gray-500 mb-1 uppercase">Test Question</label>
+                                            <input
+                                                type="text"
+                                                value={hbConfigForm.question}
+                                                onChange={e => setHbConfigForm({...hbConfigForm, question: e.target.value})}
+                                                className="w-full bg-gray-800 border border-gray-700 px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-acid"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block font-mono text-xs text-gray-500 mb-1 uppercase">Telegram Bot Token</label>
+                                            <input
+                                                type="password"
+                                                value={hbConfigForm.tg_bot_token || ''}
+                                                onChange={e => setHbConfigForm({...hbConfigForm, tg_bot_token: e.target.value || null})}
+                                                placeholder="Optional..."
+                                                className="w-full bg-gray-800 border border-gray-700 px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-acid placeholder-gray-600"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block font-mono text-xs text-gray-500 mb-1 uppercase">Telegram Chat ID</label>
+                                            <input
+                                                type="text"
+                                                value={hbConfigForm.tg_chat_id || ''}
+                                                onChange={e => setHbConfigForm({...hbConfigForm, tg_chat_id: e.target.value || null})}
+                                                placeholder="Optional..."
+                                                className="w-full bg-gray-800 border border-gray-700 px-3 py-2 text-white font-mono text-sm focus:outline-none focus:border-acid placeholder-gray-600"
+                                            />
+                                        </div>
+                                        <div className="flex items-end">
+                                            <button
+                                                onClick={handleSaveHbConfig}
+                                                className="px-4 py-2 bg-acid text-black font-bold font-mono text-sm uppercase hover:bg-white transition-colors shadow-hard-acid hover:shadow-none hover:translate-x-[2px] hover:translate-y-[2px]"
+                                            >
+                                                Save Config
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
 
                     {/* Main Panel */}
                     <div className="border-2 border-white bg-black p-1 shadow-[8px_8px_0px_0px_rgba(255,255,255,0.2)]">
@@ -401,8 +626,12 @@
                                     Active Tokens
                                 </h2>
                                 <div className="flex gap-3">
-                                    <button onClick={refreshData} className="px-4 py-2 bg-gray-800 border border-gray-600 hover:bg-white hover:text-black hover:border-white transition-all font-mono text-sm uppercase flex items-center gap-2 group shadow-hard hover:shadow-none hover:translate-x-[2px] hover:translate-y-[2px]">
-                                        <span className={`transition-transform duration-500 ${isLoading ? 'animate-spin' : 'group-hover:rotate-180'}`}>↻</span> REFRESH
+                                    <button
+                                        onClick={() => handleHeartbeatAction('test')}
+                                        className={`px-4 py-2 bg-gray-800 border border-gray-600 font-mono text-sm uppercase flex items-center gap-2 group shadow-hard hover:shadow-none hover:translate-x-[2px] hover:translate-y-[2px] transition-all ${!isGlobalTesting && testingIds.size === 0 ? 'hover:bg-white hover:text-black hover:border-white' : 'opacity-50 cursor-not-allowed'}`}
+                                        disabled={isGlobalTesting || testingIds.size > 0}
+                                    >
+                                        <span className={`transition-transform duration-500 ${isGlobalTesting ? 'animate-spin' : ''}`}>♥</span> TEST ALL
                                     </button>
                                     <button
                                         onClick={() => {
@@ -432,23 +661,27 @@
                                             <tr className="border-b-2 border-gray-700">
                                                 <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Identifier</th>
                                                 <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">State</th>
-                                                <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Load</th>
+                                                <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Dynamic Weight</th>
                                                 <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Reqs</th>
-                                                <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Failures</th>
+                                                <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest">Last Check</th>
                                                 <th className="p-4 font-mono text-xs text-gray-500 uppercase tracking-widest text-right">Controls</th>
                                             </tr>
                                         </thead>
                                         <tbody className="font-mono text-sm">
                                             {data.clients.map(c => (
                                                 <tr key={c.id} className="border-b border-gray-800 hover:bg-gray-900/50 transition-colors group">
-                                                    <td className="p-4 font-bold text-white"><span className="text-neon-blue mr-2">&gt;</span>{c.id}</td>
+                                                    <td className="p-4 font-bold text-white"><span className="text-neon-blue mr-2">&gt;</span>{maskIdentifier(c.id)}</td>
                                                     <td className="p-4">
                                                         {!c.enabled ? (
                                                             <span className="px-2 py-1 bg-gray-800 text-gray-500 text-xs border border-gray-700">DISABLED</span>
-                                                        ) : c.available ? (
-                                                            <span className="px-2 py-1 bg-green-900/30 text-green-400 text-xs border border-green-900 animate-pulse">ONLINE</span>
+                                                        ) : !c.available ? (
+                                                            <span className="px-2 py-1 bg-yellow-900/30 text-yellow-400 text-xs border border-yellow-900">BACKOFF</span>
+                                                        ) : c.state === 'offline' ? (
+                                                            <span className="px-2 py-1 bg-red-900/30 text-red-400 text-xs border border-red-900">OFFLINE</span>
+                                                        ) : c.state === 'normal' ? (
+                                                            <span className="px-2 py-1 bg-green-900/30 text-green-400 text-xs border border-green-900">HEALTHY</span>
                                                         ) : (
-                                                            <span className="px-2 py-1 bg-red-900/30 text-red-400 text-xs border border-red-900">BACKOFF</span>
+                                                            <span className="px-2 py-1 bg-blue-900/30 text-blue-400 text-xs border border-blue-900">READY</span>
                                                         )}
                                                     </td>
                                                     <td className="p-4">
@@ -459,11 +692,14 @@
                                                             <span className="text-xs text-gray-500">{c.weight}%</span>
                                                         </div>
                                                     </td>
-                                                    <td className="p-4 text-gray-400">{c.request_count || 0}</td>
-                                                    <td className="p-4">
-                                                        <span className={(c.fail_count > 0 || c.pro_fail_count > 0) ? 'text-danger' : 'text-gray-500'}>
-                                                            E:{c.fail_count || 0} / P:{c.pro_fail_count || 0}
-                                                        </span>
+                                                    <td className="p-4 text-gray-400">
+                                                        <div>{c.request_count || 0}</div>
+                                                        <div className={(c.fail_count > 0 || c.pro_fail_count > 0) ? 'text-danger text-xs' : 'text-gray-600 text-xs'}>
+                                                            E:{c.fail_count} / P:{c.pro_fail_count}
+                                                        </div>
+                                                    </td>
+                                                    <td className="p-4 text-gray-500 text-xs">
+                                                        {c.last_heartbeat_at ? new Date(c.last_heartbeat_at).toLocaleTimeString() : '-'}
                                                     </td>
                                                     <td className="p-4 text-right">
                                                         <div className={`flex justify-end gap-2 ${isAuthenticated ? '' : 'opacity-50'}`}>
@@ -483,11 +719,11 @@
                                                                 >[RESUME]</button>
                                                             )}
                                                             <button
-                                                                className={`p-1 transition-colors ${isAuthenticated ? 'hover:text-neon-blue' : 'cursor-not-allowed'}`}
-                                                                onClick={() => handleClientAction('reset', c.id)}
-                                                                title="Reset"
-                                                                disabled={!isAuthenticated}
-                                                            >[RESET]</button>
+                                                                className={`p-1 transition-colors ${isAuthenticated && !isGlobalTesting && !testingIds.has(c.id) ? 'hover:text-neon-blue' : 'cursor-not-allowed opacity-50'}`}
+                                                                onClick={() => handleHeartbeatAction('test', {id: c.id})}
+                                                                title="Test Heartbeat"
+                                                                disabled={!isAuthenticated || isGlobalTesting || testingIds.has(c.id)}
+                                                            >[TEST]</button>
                                                             <button
                                                                 className={`p-1 transition-colors ${isAuthenticated ? 'hover:text-danger' : 'cursor-not-allowed'}`}
                                                                 onClick={() => confirmRemove(c.id)}

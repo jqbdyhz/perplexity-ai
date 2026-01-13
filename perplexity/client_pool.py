@@ -2,9 +2,12 @@
 Client pool for managing multiple Perplexity API tokens with load balancing.
 
 Provides round-robin client selection with exponential backoff retry on failures.
+Supports heartbeat testing to automatically verify token health.
 """
 
+import asyncio
 import json
+import logging
 import pathlib
 import os
 import threading
@@ -13,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .client import Client
+
+logger = logging.getLogger(__name__)
 
 
 class ClientWrapper:
@@ -37,6 +42,8 @@ class ClientWrapper:
         self.weight = self.DEFAULT_WEIGHT  # Higher weight = higher priority
         self.pro_fail_count = 0  # Track pro-specific failures
         self.enabled = True  # Whether this client is enabled for use
+        self.state = "unknown"  # Token state: "normal", "offline", "unknown"
+        self.last_heartbeat: Optional[float] = None  # Last heartbeat check timestamp
 
     def is_available(self) -> bool:
         """Check if the client is currently available (enabled and not in backoff)."""
@@ -77,12 +84,20 @@ class ClientWrapper:
                 self.available_after, tz=timezone.utc
             ).isoformat()
 
+        last_heartbeat_at = None
+        if self.last_heartbeat:
+            last_heartbeat_at = datetime.fromtimestamp(
+                self.last_heartbeat, tz=timezone.utc
+            ).isoformat()
+
         return {
             "id": self.id,
             "available": self.is_available(),
             "enabled": self.enabled,
+            "state": self.state,
             "fail_count": self.fail_count,
             "next_available_at": next_available_at,
+            "last_heartbeat_at": last_heartbeat_at,
             "request_count": self.request_count,
             "weight": self.weight,
             "pro_fail_count": self.pro_fail_count,
@@ -98,6 +113,7 @@ class ClientPool:
     Pool of Client instances with round-robin load balancing.
 
     Supports dynamic addition and removal of clients at runtime.
+    Supports heartbeat testing for automatic token health verification.
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -106,6 +122,17 @@ class ClientPool:
         self._index = 0
         self._lock = threading.Lock()
         self._mode = "anonymous"
+
+        # Heartbeat configuration
+        self._heartbeat_config: Dict[str, Any] = {
+            "enable": False,
+            "question": "现在是农历几月几号？",
+            "interval": 6,  # hours
+            "tg_bot_token": None,
+            "tg_chat_id": None
+        }
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._config_path: Optional[str] = None
 
         # Load initial clients from config or environment
         self._initialize(config_path)
@@ -151,8 +178,20 @@ class ClientPool:
 
     def _load_from_config(self, config_path: str) -> None:
         """Load clients from a JSON configuration file."""
+        self._config_path = config_path
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
+
+        # Load heartbeat configuration if present
+        heart_beat = config.get("heart_beat")
+        if heart_beat and isinstance(heart_beat, dict):
+            self._heartbeat_config = {
+                "enable": heart_beat.get("enable", False),
+                "question": heart_beat.get("question", "现在是农历几月几号？"),
+                "interval": heart_beat.get("interval", 6),
+                "tg_bot_token": heart_beat.get("tg_bot_token"),
+                "tg_chat_id": heart_beat.get("tg_chat_id")
+            }
 
         tokens = config.get("tokens", [])
         if not tokens:
@@ -457,3 +496,224 @@ class ClientPool:
             for client_id, wrapper in self.clients.items():
                 result[client_id] = wrapper.get_user_info()
             return {"status": "ok", "data": result}
+
+    # ==================== Heartbeat Methods ====================
+
+    def get_heartbeat_config(self) -> Dict[str, Any]:
+        """Get the current heartbeat configuration."""
+        return self._heartbeat_config.copy()
+
+    def update_heartbeat_config(self, new_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update heartbeat configuration and save to config file.
+
+        Args:
+            new_config: Dict with configuration fields to update
+
+        Returns:
+            Dict with status and updated config
+        """
+        # Update in-memory config
+        for key in ["enable", "question", "interval", "tg_bot_token", "tg_chat_id"]:
+            if key in new_config:
+                self._heartbeat_config[key] = new_config[key]
+
+        # Save to config file if available
+        if self._config_path and os.path.exists(self._config_path):
+            try:
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+
+                # Update heart_beat section
+                config["heart_beat"] = {
+                    "enable": self._heartbeat_config["enable"],
+                    "question": self._heartbeat_config["question"],
+                    "interval": self._heartbeat_config["interval"],
+                    "tg_bot_token": self._heartbeat_config["tg_bot_token"],
+                    "tg_chat_id": self._heartbeat_config["tg_chat_id"]
+                }
+
+                with open(self._config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"Heartbeat config saved to {self._config_path}")
+            except Exception as e:
+                logger.error(f"Failed to save heartbeat config: {e}")
+                return {"status": "error", "message": f"Failed to save config: {e}"}
+
+        return {"status": "ok", "config": self._heartbeat_config.copy()}
+
+    def is_heartbeat_enabled(self) -> bool:
+        """Check if heartbeat is enabled."""
+        return self._heartbeat_config.get("enable", False)
+
+    async def _send_telegram_notification(self, message: str) -> None:
+        """Send a notification to Telegram."""
+        bot_token = self._heartbeat_config.get("tg_bot_token")
+        chat_id = self._heartbeat_config.get("tg_chat_id")
+
+        if not bot_token or not chat_id:
+            logger.warning("Telegram notification skipped: tg_bot_token or tg_chat_id not configured")
+            return
+
+        try:
+            import aiohttp
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Failed to send Telegram notification: {await resp.text()}")
+                    else:
+                        logger.info(f"Telegram notification sent: {message}")
+        except ImportError:
+            logger.warning("aiohttp not installed, Telegram notification skipped")
+        except Exception as e:
+            logger.error(f"Error sending Telegram notification: {e}")
+
+    async def test_client(self, client_id: str) -> Dict[str, Any]:
+        """
+        Test a single client by performing a query.
+
+        Returns:
+            Dict with status and result
+        """
+        with self._lock:
+            wrapper = self.clients.get(client_id)
+            if not wrapper:
+                return {"status": "error", "message": f"Client '{client_id}' not found"}
+            client = wrapper.client
+
+        question = self._heartbeat_config.get("question", "现在是农历几月几号？")
+        prev_state = wrapper.state
+
+        try:
+            # Perform a simple search query
+            response = await asyncio.to_thread(
+                client.search,
+                question,
+                mode="auto",
+                model=None,
+                sources=["web"],
+                files={},
+                stream=False,
+                language="zh-CN",
+                incognito=True,
+            )
+
+            # Check if response contains answer
+            if response and "answer" in response:
+                with self._lock:
+                    wrapper.state = "normal"
+                    wrapper.last_heartbeat = time.time()
+                logger.info(f"Heartbeat test passed for client '{client_id}'")
+                return {"status": "ok", "state": "normal", "client_id": client_id}
+            else:
+                with self._lock:
+                    wrapper.state = "offline"
+                    wrapper.last_heartbeat = time.time()
+                logger.warning(f"Heartbeat test failed for client '{client_id}': no answer in response")
+
+                # Send Telegram notification if state changed to offline
+                if prev_state != "offline":
+                    await self._send_telegram_notification(
+                        f"⚠️ perplexity mcp: <b>{client_id}</b> test failed."
+                    )
+
+                return {"status": "error", "state": "offline", "client_id": client_id}
+
+        except Exception as e:
+            with self._lock:
+                wrapper.state = "offline"
+                wrapper.last_heartbeat = time.time()
+            logger.error(f"Heartbeat test failed for client '{client_id}': {e}")
+
+            # Send Telegram notification if state changed to offline
+            if prev_state != "offline":
+                await self._send_telegram_notification(
+                    f"⚠️ perplexity mcp: <b>{client_id}</b> test failed."
+                )
+
+            return {"status": "error", "state": "offline", "client_id": client_id, "error": str(e)}
+
+    async def test_all_clients(self) -> Dict[str, Any]:
+        """
+        Test all clients in the pool.
+
+        Returns:
+            Dict with status and results for each client
+        """
+        results = {}
+        client_ids = list(self.clients.keys())
+
+        for client_id in client_ids:
+            result = await self.test_client(client_id)
+            results[client_id] = result
+            # Add a small delay between tests to avoid rate limiting
+            await asyncio.sleep(2)
+
+        return {"status": "ok", "results": results}
+
+    async def _heartbeat_loop(self) -> None:
+        """Background task that periodically tests all clients."""
+        interval_hours = self._heartbeat_config.get("interval", 6)
+        interval_seconds = interval_hours * 3600
+
+        logger.info(f"Heartbeat loop started, interval: {interval_hours} hours")
+
+        while True:
+            try:
+                # Test all clients
+                logger.info("Starting heartbeat test for all clients...")
+                await self.test_all_clients()
+                logger.info("Heartbeat test completed")
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}")
+
+            # Wait for next interval
+            await asyncio.sleep(interval_seconds)
+
+    def start_heartbeat(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> bool:
+        """
+        Start the heartbeat background task.
+
+        Args:
+            loop: Optional event loop to use. If not provided, will try to get the running loop.
+
+        Returns:
+            True if heartbeat was started, False if disabled or already running
+        """
+        if not self.is_heartbeat_enabled():
+            logger.info("Heartbeat is disabled, not starting")
+            return False
+
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            logger.info("Heartbeat task already running")
+            return False
+
+        try:
+            if loop is None:
+                loop = asyncio.get_running_loop()
+            self._heartbeat_task = loop.create_task(self._heartbeat_loop())
+            logger.info("Heartbeat task started")
+            return True
+        except RuntimeError:
+            logger.warning("No running event loop, heartbeat not started")
+            return False
+
+    def stop_heartbeat(self) -> bool:
+        """
+        Stop the heartbeat background task.
+
+        Returns:
+            True if heartbeat was stopped, False if not running
+        """
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            logger.info("Heartbeat task stopped")
+            return True
+        return False
