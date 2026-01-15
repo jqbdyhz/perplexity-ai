@@ -1,0 +1,101 @@
+name: Sync with Upstream
+
+on:
+  schedule:
+    # 每天北京时间早上 8 点检查（UTC 0:00）
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/escapeWu/perplexity-ai.git || true
+          git fetch upstream
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/main --count)
+          echo "upstream_commits=$UPSTREAM_COMMITS" >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_COMMITS" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "📦 Found $UPSTREAM_COMMITS new commits from upstream"
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "✅ Already up to date with upstream"
+          fi
+
+      - name: Try to merge upstream (fast-forward or clean merge)
+        id: merge
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          # 尝试合并
+          if git merge upstream/main --no-edit; then
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            echo "✅ Successfully merged upstream changes"
+          else
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Merge conflicts detected"
+            git merge --abort
+          fi
+
+      - name: Push merged changes
+        if: steps.check.outputs.has_updates == 'true' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          git push origin main
+          echo "🚀 Pushed merged changes to origin/main"
+
+      - name: Create Pull Request on conflict
+        if: steps.check.outputs.has_updates == 'true' && steps.merge.outputs.merge_success == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "sync: merge upstream changes (manual resolution needed)"
+          branch: sync-upstream-${{ github.run_number }}
+          delete-branch: true
+          title: "⚠️ Sync Upstream: Manual merge required"
+          body: |
+            ## 上游更新需要手动合并
+
+            自动同步检测到上游 [escapeWu/perplexity-ai](https://github.com/escapeWu/perplexity-ai) 有更新，但存在合并冲突。
+
+            ### 需要你做的：
+            1. 在本地拉取此分支
+            2. 手动解决冲突
+            3. 合并到 main 分支
+
+            ### 本地操作命令：
+            ```bash
+            git fetch origin
+            git checkout sync-upstream-${{ github.run_number }}
+            git fetch upstream
+            git merge upstream/main
+            # 解决冲突后
+            git add .
+            git commit -m "resolve merge conflicts with upstream"
+            git push
+            ```
+
+            ---
+            *此 PR 由 GitHub Actions 自动创建*
+          labels: |
+            sync-upstream
+            needs-manual-merge
