@@ -7,6 +7,7 @@ Supports multi-token pool with load balancing and dynamic management.
 import argparse
 import asyncio
 import os
+import re
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from fastmcp import FastMCP
@@ -337,16 +338,77 @@ def list_models_tool() -> Dict[str, Any]:
     }
 
 
-def _extract_clean_result(response: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract the final answer and source links from the search response."""
-    result = {}
+def _is_valid_url(url: str) -> bool:
+    """Check if a string looks like a valid URL."""
+    url = url.strip()
+    if not url:
+        return False
+    # 检查是否包含任何空白字符
+    if re.search(r'\s', url):
+        return False
+    # 必须以 http:// 或 https:// 开头
+    if url.lower().startswith(('http://', 'https://')):
+        # 确保协议后有内容（至少有域名部分）
+        after_scheme = url.split('://', 1)[1] if '://' in url else ''
+        if after_scheme and '.' in after_scheme:
+            return True
+    return False
 
-    # 提取最终答案
-    if "answer" in response:
-        result["answer"] = response["answer"]
 
-    # 提取来源链接
+def _normalize_url(value: Any, _depth: int = 0) -> Optional[str]:
+    """
+    Normalize a URL value to a valid string URL.
+    Handles: string, list (recursively), nested dict with href/url/link.
+    Returns None if not a valid URL.
+
+    Args:
+        value: The value to normalize
+        _depth: Internal recursion depth counter (max 10 to prevent infinite loops)
+    """
+    # 防止无限递归
+    if _depth > 10:
+        return None
+
+    # 直接字符串
+    if isinstance(value, str):
+        url = value.strip()
+        if _is_valid_url(url):
+            return url
+        return None
+
+    # 列表形式：递归处理每个元素，取首个有效 URL
+    if isinstance(value, list) and value:
+        for item in value:
+            url = _normalize_url(item, _depth + 1)
+            if url:
+                return url
+        return None
+
+    # 嵌套 dict 形式
+    if isinstance(value, dict):
+        # 先尝试提取标准字段 href/url/link
+        nested = value.get("href") or value.get("url") or value.get("link")
+        if nested:
+            url = _normalize_url(nested, _depth + 1)
+            if url:
+                return url
+        # 如果标准字段不存在或无效，遍历所有 values 递归查找
+        for v in value.values():
+            url = _normalize_url(v, _depth + 1)
+            if url:
+                return url
+        return None
+
+    return None
+
+
+def _extract_sources(response: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Extract source links from the search response.
+    Returns deduplicated sources with stable ordering, containing only url and short title.
+    """
     sources = []
+    seen_urls = set()
 
     # 方法1: 从 text 字段的 SEARCH_RESULTS 步骤中提取 web_results
     if "text" in response and isinstance(response["text"], list):
@@ -355,27 +417,134 @@ def _extract_clean_result(response: Dict[str, Any]) -> Dict[str, Any]:
                 content = step.get("content", {})
                 web_results = content.get("web_results", [])
                 for web_result in web_results:
-                    if isinstance(web_result, dict) and "url" in web_result:
-                        source = {"url": web_result["url"]}
-                        if "name" in web_result:
-                            source["title"] = web_result["name"]
-                        sources.append(source)
+                    if isinstance(web_result, dict):
+                        url = _normalize_url(web_result.get("url"))
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            source = {"url": url}
+                            if "name" in web_result:
+                                # 截断过长的 title（最多 80 字符）
+                                title = web_result["name"][:80]
+                                if len(web_result["name"]) > 80:
+                                    title += "..."
+                                source["title"] = title
+                            sources.append(source)
 
-    # 方法2: 备用 - 从 chunks 字段提取（如果 chunks 包含 URL）
+    # 方法2: 备用 - 从 chunks 字段提取
     if not sources and "chunks" in response and isinstance(response["chunks"], list):
         for chunk in response["chunks"]:
             if isinstance(chunk, dict):
-                source = {}
-                if "url" in chunk:
-                    source["url"] = chunk["url"]
-                if "title" in chunk:
-                    source["title"] = chunk["title"]
-                if "name" in chunk and "title" not in source:
-                    source["title"] = chunk["name"]
-                if "url" in source:
+                url = _normalize_url(chunk.get("url"))
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    source = {"url": url}
+                    title_raw = chunk.get("title") or chunk.get("name", "")
+                    if title_raw:
+                        title = title_raw[:80]
+                        if len(title_raw) > 80:
+                            title += "..."
+                        source["title"] = title
                     sources.append(source)
 
-    result["sources"] = sources
+    # 方法3: Fallback - 从顶层 sources 字段提取（兼容未来响应结构变化）
+    if not sources and "sources" in response and isinstance(response["sources"], list):
+        for src in response["sources"]:
+            # 统一使用 _normalize_url 处理任意类型（string/list/dict/嵌套）
+            title_raw = ""
+
+            if isinstance(src, dict):
+                # 对于 dict，直接递归处理（_normalize_url 会优先检查 href/url/link）
+                url = _normalize_url(src)
+                title_raw = src.get("title") or src.get("name", "")
+            else:
+                # 对于其他类型（string/list/嵌套），直接递归处理
+                url = _normalize_url(src)
+
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                source = {"url": url}
+                if title_raw:
+                    title = title_raw[:80]
+                    if len(title_raw) > 80:
+                        title += "..."
+                    source["title"] = title
+                sources.append(source)
+
+    return sources
+
+
+def _clean_citation_markers(text: str) -> str:
+    """
+    Remove citation markers from text to avoid confusion when sources are not included.
+    Handles: [1], [1,2], [1-3], [^1], 【1】, （1）, <sup>1</sup>, etc.
+    Note: Superscript numbers are NOT cleaned to avoid damaging units like m² or x².
+    Code blocks (``` and `) are preserved to avoid damaging code examples.
+    """
+    # 保护代码块：先提取并替换为占位符
+    code_blocks = []
+
+    def save_code_block(match):
+        code_blocks.append(match.group(0))
+        return f"\x00CODE_BLOCK_{len(code_blocks) - 1}\x00"
+
+    # 保护多行代码块 ```...```
+    text = re.sub(r'```[\s\S]*?```', save_code_block, text)
+    # 保护行内代码 `...`
+    text = re.sub(r'`[^`]+`', save_code_block, text)
+
+    # 英文方括号: [1], [12], [1,2], [1-3], [1 - 3], [1–3], [1—3] (允许分隔符前后空格)
+    text = re.sub(r'\[\d+(?:\s*[,\-–—]\s*\d+)*\]', '', text)
+    # 脚注格式: [^1], [^12]
+    text = re.sub(r'\[\^\d+\]', '', text)
+    # 中文方括号: 【1】, 【12】
+    text = re.sub(r'【\d+】', '', text)
+    # 中文圆括号: （1）, （12）
+    text = re.sub(r'（\d+）', '', text)
+    # HTML 上标格式: <sup>1</sup>, <sup>12</sup>
+    text = re.sub(r'<sup>\d+</sup>', '', text, flags=re.IGNORECASE)
+    # 注意：不清理上标数字 ¹²³，因为可能误伤 m²、x² 等单位/幂次
+    # 清理多余空格（连续空格变单个）
+    text = re.sub(r' +', ' ', text)
+    # 英文标点前空格删除
+    text = re.sub(r' ([.,;:!?])', r'\1', text)
+    # 中文标点前空格删除
+    text = re.sub(r' ([，。；：！？])', r'\1', text)
+
+    # 恢复代码块
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CODE_BLOCK_{i}\x00", block)
+
+    return text.strip()
+
+
+def _extract_clean_result(response: Dict[str, Any], include_sources: bool = False) -> Dict[str, Any]:
+    """
+    Extract the final answer from the search response.
+
+    Args:
+        response: Raw response from Perplexity API
+        include_sources: If True, include source links in response
+
+    Returns:
+        Dict with 'answer' and 'sources' (empty list if include_sources=False)
+
+    Note:
+        Citation markers like [1][2] are ALWAYS removed from answer because
+        the order of returned sources may not match the original citation numbers.
+        This prevents user confusion about which source corresponds to which number.
+    """
+    result = {}
+
+    if "answer" in response:
+        answer = response["answer"]
+        # 始终清理引用标记，因为 sources 顺序可能与原始标号不一致
+        answer = _clean_citation_markers(answer)
+        result["answer"] = answer
+
+    if include_sources:
+        result["sources"] = _extract_sources(response)
+    else:
+        result["sources"] = []  # 兼容性：始终返回 sources 字段
 
     return result
 
@@ -388,6 +557,7 @@ def _run_query(
     language: str = "en-US",
     incognito: bool = False,
     files: Optional[Union[Dict[str, Any], Iterable[str]]] = None,
+    include_sources: bool = False,
 ) -> Dict[str, Any]:
     """Execute a Perplexity query (non-streaming) and return the final response."""
     pool = _get_pool()
@@ -430,7 +600,7 @@ def _run_query(
         pool.mark_client_success(client_id)
 
         # 只返回精简的最终结果
-        clean_result = _extract_clean_result(response)
+        clean_result = _extract_clean_result(response, include_sources=include_sources)
         return {"status": "ok", "data": clean_result}
     except ValidationError as exc:
         # Pro mode specific failures (like quota exhausted) - reduce weight
@@ -480,6 +650,7 @@ async def search(
     language: str = "en-US",
     incognito: bool = False,
     files: Optional[Union[Dict[str, Any], Iterable[str]]] = None,
+    include_sources: bool = False,
 ) -> Dict[str, Any]:
     """
     Perplexity 快速搜索 - 用于获取实时网络信息和简单问题解答
@@ -497,23 +668,40 @@ async def search(
             - 'gpt-5.2': OpenAI 最新模型
             - 'claude-4.5-sonnet': Anthropic Claude
             - 'grok-4.1': xAI Grok
-        sources: 搜索来源列表
+        sources: 搜索来源列表 (注意：此参数指定搜索范围，非返回的引用链接)
             - 'web': 网页搜索 (默认)
             - 'scholar': 学术论文
             - 'social': 社交媒体
         language: 响应语言代码 (默认 'en-US'，中文用 'zh-CN')
         incognito: 隐身模式，不保存搜索历史
         files: 上传文件 (用于分析文档内容)
+        include_sources: 是否返回引用来源链接 (默认 False，不返回以节省 token)
 
     Returns:
-        {"status": "ok", "data": {"answer": "搜索结果...", "sources": [{"title": "...", "url": "..."}]}}
+        {
+            "status": "ok",
+            "data": {
+                "answer": "搜索结果...",
+                "sources": []  # 默认为空列表；若 include_sources=True 则包含引用链接
+            }
+        }
         或 {"status": "error", "error_type": "...", "message": "..."}
     """
     # 限制 search 只能使用 auto 或 pro 模式
     if mode not in ["auto", "pro"]:
         mode = "pro"
     # 使用 asyncio.to_thread 避免阻塞事件循环
-    return await asyncio.to_thread(_run_query, query, mode, model, sources, language, incognito, files)
+    return await asyncio.to_thread(
+        _run_query,
+        query=query,
+        mode=mode,
+        model=model,
+        sources=sources,
+        language=language,
+        incognito=incognito,
+        files=files,
+        include_sources=include_sources,
+    )
 
 
 @mcp.tool
@@ -525,6 +713,7 @@ async def research(
     language: str = "en-US",
     incognito: bool = False,
     files: Optional[Union[Dict[str, Any], Iterable[str]]] = None,
+    include_sources: bool = False,
 ) -> Dict[str, Any]:
     """
     Perplexity 深度研究 - 用于复杂问题分析和深度调研
@@ -542,23 +731,40 @@ async def research(
             - 'claude-4.5-sonnet-thinking': Claude 推理模型
             - 'kimi-k2-thinking': Moonshot Kimi
             - 'grok-4.1-reasoning': xAI Grok 推理
-        sources: 搜索来源列表
+        sources: 搜索来源列表 (注意：此参数指定搜索范围，非返回的引用链接)
             - 'web': 网页搜索 (默认)
             - 'scholar': 学术论文 (学术研究推荐)
             - 'social': 社交媒体
         language: 响应语言代码 (默认 'en-US'，中文用 'zh-CN')
         incognito: 隐身模式，不保存搜索历史
         files: 上传文件 (用于分析文档内容)
+        include_sources: 是否返回引用来源链接 (默认 False，不返回以节省 token)
 
     Returns:
-        {"status": "ok", "data": {"answer": "研究结果...", "sources": [{"title": "...", "url": "..."}]}}
+        {
+            "status": "ok",
+            "data": {
+                "answer": "研究结果...",
+                "sources": []  # 默认为空列表；若 include_sources=True 则包含引用链接
+            }
+        }
         或 {"status": "error", "error_type": "...", "message": "..."}
     """
     # 限制 research 只能使用 reasoning 或 deep research 模式
     if mode not in ["reasoning", "deep research"]:
         mode = "reasoning"
     # 使用 asyncio.to_thread 避免阻塞事件循环
-    return await asyncio.to_thread(_run_query, query, mode, model, sources, language, incognito, files)
+    return await asyncio.to_thread(
+        _run_query,
+        query=query,
+        mode=mode,
+        model=model,
+        sources=sources,
+        language=language,
+        incognito=incognito,
+        files=files,
+        include_sources=include_sources,
+    )
 
 
 def run_server(

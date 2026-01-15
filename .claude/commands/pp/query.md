@@ -17,7 +17,8 @@ Use Perplexity quick search to get real-time web information and answer simple q
 **Steps**
 1. Use `mcp__perplexity__search` tool with the user's query.
 2. Set `language: "zh-CN"` for Chinese responses.
-3. Keep relative context as part of the answer.
-4. Present the results clearly with sources.
+3. Set `include_sources: true` if the user requests sources/references/citations.
+4. Keep relative context as part of the answer.
+5. Present the results clearly (with sources if requested).
 
 **Query**: $ARGUMENTS
